@@ -1,0 +1,42 @@
+{
+    "metadata": {
+        "title": "My First Deep Learning Note",
+        "created_at": "2025-12-26T06:21:01.585221",
+        "last_modified": "2025-12-26T06:21:01.585221",
+        "version": 1.0,
+        "note_id": "b60af6f0-ac35-445f-bc2c-62df8eaa3ba6",
+        "status": 0,
+        "tags": []
+    },
+    "custom_fields": {},
+    "blocks": [
+        {
+            "block_id": "af176423-2d39-410e-b65e-7b908d5f76a6",
+            "type": "text",
+            "version": 1.0,
+            "backlinks": [],
+            "tags": [
+                "summary",
+                "todo"
+            ],
+            "data": {
+                "content": "This is the actual text content of my note.",
+                "format": "markdown"
+            }
+        },
+        {
+            "block_id": "e39653ee-17ac-4729-9ac7-cffe3dff8afc",
+            "type": "text",
+            "version": 1.0,
+            "backlinks": [],
+            "tags": [
+                "summary",
+                "todo"
+            ],
+            "data": {
+                "content": "This is the Second Block",
+                "format": "markdown"
+            }
+        }
+    ]
+}

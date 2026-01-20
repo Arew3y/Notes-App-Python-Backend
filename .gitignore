@@ -1,0 +1,4 @@
+/.venv/
+/sandbox.ipynb
+/.idea/
+/__pycache__/
