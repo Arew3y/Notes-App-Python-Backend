@@ -1,322 +1,346 @@
 import json
 import ijson
-import uuid
 import os
 import shutil
-from datetime import datetime
+from typing import Union, Callable, Optional, Dict, Any
 from pathlib import Path
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
-# Import the specific dataclasses and the DB class
+# Imports from project modules
 from cache_db import FileIndex, NoteMetadata, DirectoryMetadata
+from note_schema import JNote
+from logger_service import sys_log, LogSource, LogLevel
 
 # Initialize the DB
 localdb = FileIndex()
 
 
 # ==========================================
-# Core Scanning & Sync Logic
+# Placeholder for Active State Notification
+# ==========================================
+# This callback allows the Watcher to poke ActiveState when things change.
+_on_file_change_callback: Optional[Callable[[str, float], None]] = None
+
+def register_change_callback(func: Callable[[str, float], None]):
+    """
+    Called by main.py to hook up the ActiveManager.
+    """
+    global _on_file_change_callback
+    _on_file_change_callback = func
+
+
+# ==========================================
+# Vault Watcher
 # ==========================================
 
-def initialize_vault_scan(root_dir: Path):
+class VaultEventHandler(FileSystemEventHandler):
     """
-    Full scan: Wipes the DB for this root and rebuilds it from scratch.
-    Useful for initialization or hard resets.
+    Handles all file system events and updates the CacheDB accordingly.
+    This acts as the ONLY writer to the DB for structure changes.
     """
-    root_dir = Path(root_dir)
-    if not root_dir.exists():
-        return
 
-    # Optional: Clear existing entries for this root (if you track roots)
-    # localdb.cursor.execute("DELETE FROM notes")
-    # localdb.cursor.execute("DELETE FROM directories")
+    def _get_note_meta(self, file_path: str) -> Optional[Dict]:
+        """Helper to extract metadata efficiently."""
+        return VaultWatcher.extract_note_metadata(Path(file_path))
 
-    _walk_and_populate(root_dir)
+    def on_created(self, event):
+        path = Path(event.src_path)
+        sys_log.log(LogSource.SYSTEM, LogLevel.DEBUG, f"Watcher: Created {path.name}")
 
-
-def quick_scan(root_dir: Path):
-    """
-    Smart Sync:
-    1. Walks the filesystem to find new/modified files.
-    2. Checks the DB to find 'ghost' files (entries that no longer exist on disk) and removes them.
-    """
-    root_dir = Path(root_dir)
-    if not root_dir.exists():
-        return
-
-    # Track what we find on disk to verify against DB later
-    found_note_ids = set()
-    found_dir_paths = set()
-
-    # 1. Walk disk and Upsert (Add/Update)
-    for current_path, dirs, files in os.walk(root_dir):
-        current_path_obj = Path(current_path)
-
-        # Track Directory
-        found_dir_paths.add(str(current_path_obj))
-
-        # Register/Update Directory in DB
-        # We skip the root folder itself if strictly needed, but usually it's fine
-        if current_path_obj != root_dir:
-            dir_meta = DirectoryMetadata(
-                dir_path=current_path_obj,
-                dir_name=current_path_obj.name,
-                parent_path=current_path_obj.parent
-            )
-            localdb.add_directory(dir_meta)
-
-        # Process Files
-        for file_name in files:
-            if file_name.endswith(".jnote"):
-                file_path = current_path_obj / file_name
-                try:
-                    # We only read metadata to save IO
-                    raw_meta = extract_note_metadata(file_path)
-                    if not raw_meta: continue
-
-                    n_id = raw_meta.get("note_id")
-                    if n_id:
-                        found_note_ids.add(n_id)
-
-                        # Upsert Note into DB
-                        note_obj = NoteMetadata(
-                            note_id=n_id,
-                            note_title=raw_meta.get("title", file_name),
-                            note_version=str(raw_meta.get("version", "1.0")),
-                            note_dir=current_path_obj
-                        )
-                        localdb.add_metadata(note_obj)
-                except Exception:
-                    continue
-
-    # 2. Cleanup (Garbage Collection)
-    # Check DB for items that were NOT found in the walk
-
-    # Clean Notes
-    all_db_notes = localdb.get_all_notes()  # You might want a lighter query just for IDs
-    for note in all_db_notes:
-        if note.note_id not in found_note_ids:
-            localdb.delete_note(note.note_id)
-
-    # Clean Directories
-    # (Implementation requires a method to get all dirs from DB, assumed similar to get_all_notes)
-    # localdb.cursor.execute("SELECT dir_path FROM directories")
-    # all_db_dirs = [r[0] for r in localdb.cursor.fetchall()]
-    # for d_path in all_db_dirs:
-    #     if d_path not in found_dir_paths:
-    #          _delete_directory_from_db_only(d_path)
-
-
-def _walk_and_populate(root_dir: Path):
-    """Helper for the full scan."""
-    print(f"Starting Scan on: {root_dir}")
-    for current_path, dirs, files in os.walk(root_dir):
-        current_path_obj = Path(current_path)
-
-        for dir_name in dirs:
-            full_dir_path = current_path_obj / dir_name
+        if event.is_directory:
+            # Register Directory
             localdb.add_directory(DirectoryMetadata(
-                dir_path=full_dir_path,
-                dir_name=dir_name,
-                parent_path=current_path_obj
+                dir_path=path,
+                dir_name=path.name,
+                parent_path=path.parent
             ))
+        elif path.suffix == ".jnote":
+            # Register Note
+            meta_dict = self._get_note_meta(event.src_path)
+            if meta_dict:
+                # Map raw dict to DB Metadata
+                db_meta = NoteMetadata(
+                    note_id=meta_dict.get("note_id"),
+                    note_title=meta_dict.get("title", path.stem),
+                    note_version=str(meta_dict.get("version", "1.0")),
+                    note_dir=path.parent
+                )
+                localdb.add_metadata(db_meta)
 
-        for file_name in files:
-            if file_name.endswith(".jnote"):
-                file_path = current_path_obj / file_name
-                raw_meta = extract_note_metadata(file_path)
-                if raw_meta:
-                    localdb.add_metadata(NoteMetadata(
-                        note_id=raw_meta.get("note_id", str(uuid.uuid4())),
-                        note_title=raw_meta.get("title", file_name),
-                        note_version=str(raw_meta.get("version", "1.0")),
-                        note_dir=current_path_obj
-                    ))
+        # Notify ActiveState (if it's a file)
+        if not event.is_directory and _on_file_change_callback:
+            try:
+                mtime = os.path.getmtime(event.src_path)
+                _on_file_change_callback(str(path.resolve()), mtime)
+            except FileNotFoundError:
+                pass
+
+    def on_deleted(self, event):
+        path = Path(event.src_path)
+        sys_log.log(LogSource.SYSTEM, LogLevel.DEBUG, f"Watcher: Deleted {path.name}")
+
+        if event.is_directory:
+            localdb.delete_directory_recursive(str(path))
+        elif path.suffix == ".jnote":
+            # We need the ID to delete from DB, but the file is gone.
+            # However, our DB 'delete_note' usually requires ID.
+            # Strategy: We can't easily look up ID from path if path is gone from DB?
+            # Actually, we can query DB by path *before* we delete, or rely on a DB method that deletes by path.
+            # For now, let's assume we handle "Ghost Cleaning" separately or add a delete_by_path to DB.
+            # Ideally: localdb.delete_note_by_path(str(path))
+            # Fallback: We'll trust the Quick Scan or explicit ID calls,
+            # BUT for a true watcher, we need to handle this.
+            # *Hack for now*: We'll leave it. The User deletes via UI (which has ID).
+            # External deletes might leave ghosts until restart.
+            pass
+
+    def on_modified(self, event):
+        if event.is_directory: return
+
+        path = Path(event.src_path)
+        if path.suffix == ".jnote":
+            # 1. Update DB (Title/Version might have changed)
+            meta_dict = self._get_note_meta(event.src_path)
+            if meta_dict:
+                db_meta = NoteMetadata(
+                    note_id=meta_dict.get("note_id"),
+                    note_title=meta_dict.get("title", path.stem),
+                    note_version=str(meta_dict.get("version", "1.0")),
+                    note_dir=path.parent
+                )
+                localdb.add_metadata(db_meta)
+
+            # 2. Notify ActiveState (CRITICAL for Hot-Swap)
+            if _on_file_change_callback:
+                try:
+                    mtime = os.path.getmtime(event.src_path)
+                    _on_file_change_callback(str(path.resolve()), mtime)
+                except:
+                    pass
+
+    def on_moved(self, event):
+        src_path = Path(event.src_path)
+        dest_path = Path(event.dest_path)
+        sys_log.log(LogSource.SYSTEM, LogLevel.INFO, f"Watcher: Moved {src_path.name} -> {dest_path.name}")
+
+        if event.is_directory:
+            localdb.update_directory(str(src_path), str(dest_path), dest_path.name)
+        elif dest_path.suffix == ".jnote":
+            # Treat as Delete + Create to be safe, or just update dir?
+            # Updating dir in DB is safer if we can look up by ID.
+            # Since we can't easily get ID from 'src_path' if file is gone,
+            # we re-scan the 'dest_path'.
+            self.on_created(event)
+
+
+class VaultWatcher:
+    """
+    Singleton service that manages the file system observer.
+    """
+
+    def __init__(self, root_path: Union[str, Path]):
+        self.root_path = Path(root_path)
+        self.observer = Observer()
+        self.handler = VaultEventHandler()
+
+    def start(self):
+        if not self.root_path.exists():
+            sys_log.log(LogSource.SYSTEM, LogLevel.ERROR, f"Vault path missing: {self.root_path}")
+            return
+
+        # 1. Initial Full Scan (Populate DB)
+        self.initialize_vault_scan()
+
+        # 2. Start Watching
+        self.observer.schedule(self.handler, str(self.root_path), recursive=True)
+        self.observer.start()
+        sys_log.log(LogSource.SYSTEM, LogLevel.INFO, f"VaultWatcher started on: {self.root_path}")
+
+    def stop(self):
+        self.observer.stop()
+        self.observer.join()
+        sys_log.log(LogSource.SYSTEM, LogLevel.INFO, "VaultWatcher stopped.")
+
+    def initialize_vault_scan(self):
+        """
+        Wipes (optionally) and rebuilds the DB index from disk.
+        """
+        sys_log.log(LogSource.SYSTEM, LogLevel.INFO, "Starting Initial Vault Scan...")
+        # localdb.cursor.execute("DELETE FROM notes") # Optional: Fresh start
+
+        for current_path, dirs, files in os.walk(self.root_path):
+            current_path_obj = Path(current_path)
+
+            # Add Directories
+            for dir_name in dirs:
+                localdb.add_directory(DirectoryMetadata(
+                    dir_path=current_path_obj / dir_name,
+                    dir_name=dir_name,
+                    parent_path=current_path_obj
+                ))
+
+            # Add Notes
+            for file_name in files:
+                if file_name.endswith(".jnote"):
+                    file_path = current_path_obj / file_name
+                    meta = self.extract_note_metadata(file_path)
+                    if meta:
+                        localdb.add_metadata(NoteMetadata(
+                            note_id=meta.get("note_id"),
+                            note_title=meta.get("title", file_name),
+                            note_version=str(meta.get("version", "1.0")),
+                            note_dir=current_path_obj
+                        ))
+
+        sys_log.log(LogSource.SYSTEM, LogLevel.INFO, "Vault Scan Complete.")
+
+    @staticmethod
+    def extract_note_metadata(file_path: Path) -> Dict[str, Any]:
+        """
+        Efficiently reads just the 'metadata' key from the JSON using ijson.
+        """
+        try:
+            with open(file_path, 'rb') as f:
+                # ijson.items returns a generator. We take the first 'metadata' object found.
+                objects = ijson.items(f, 'metadata')
+                for obj in objects:
+                    return obj
+        except Exception as e:
+            sys_log.log(LogSource.SYSTEM, LogLevel.ERROR, f"Metadata extraction failed: {file_path.name}",
+                        meta={"error": str(e)})
+        return {}
 
 
 # ==========================================
-# CRUD: Notes
+# CRUD Operations (Filesystem Only)
 # ==========================================
 
-def create_new_note(base_dir: str, title: str = "Untitled Note"):
-    # 1. Setup paths
-    base_path = Path(base_dir)
-    note_id = str(uuid.uuid4())
-    # Filename is the ID to avoid issues with special characters in titles
-    file_name = f"{note_id}.jnote"
-    file_path = base_path / file_name
-
-    # 2. Prepare the data structure
-    timestamp = datetime.now().isoformat()
-    note_data = {
-        "metadata": {
-            "title": title,
-            "created_at": timestamp,
-            "last_modified": timestamp,
-            "version": 1.0,
-            "note_id": note_id,
-            "status": 0,  # 0 = Active
-            "tags": []
-        },
-        "custom_fields": {},
-        "blocks": [
-            {
-                "block_id": str(uuid.uuid4()),
-                "type": "text",
-                "version": 1.0,
-                "backlinks": [],
-                "tags": ["summary", "todo"],
-                "data": {
-                    "content": "This is the actual text content of my note.",
-                    "format": "markdown"
-                }
-            },
-            {
-                "block_id": str(uuid.uuid4()),
-                "type": "text",
-                "version": 1.0,
-                "backlinks": [],
-                "tags": ["summary", "todo"],
-                "data": {
-                    "content": "This is the Second Block",
-                    "format": "markdown"
-                }
-            }
-        ]
-    }
-
-    # 3. Write to disk
+def create_new_note(base_dir: str, title: str = "Untitled Note") -> Dict[str, Any]:
+    """
+    Creates a JNote object, saves it to disk.
+    Watcher will handle the DB update.
+    """
     try:
+        # 1. Create Object using Schema
+        new_note = JNote.create_new(title=title)
+        note_id = new_note.metadata.note_id
+
+        # 2. Determine Path
+        file_path = Path(base_dir) / f"{note_id}.jnote"
+
+        # 3. Save to Disk
         with open(file_path, "w", encoding="utf-8") as f:
-            json.dump(note_data, f, indent=4)
+            json.dump(new_note.to_dict(), f, indent=4)
 
-        # 4. Update the DB immediately so UI stays in sync
-        # We assume the directory already exists in DB, but we add the note
-        new_note_meta = NoteMetadata(
-            note_id=note_id,
-            note_title=title,
-            note_version="1.0",
-            note_dir=base_path
-        )
-        localdb.add_metadata(new_note_meta)
-        return {"success": True, "path": str(file_path), "note_id": note_id}
+        sys_log.log(LogSource.SYSTEM, LogLevel.INFO, f"Created new note: {title}", meta={"id": note_id})
+
+        return {
+            "success": True,
+            "note_id": note_id,
+            "path": str(file_path),
+            # Return timestamp just in case caller needs it immediately
+            "mtime": os.path.getmtime(file_path)
+        }
+
     except Exception as e:
+        sys_log.log(LogSource.SYSTEM, LogLevel.ERROR, "Create note failed", meta={"error": str(e)})
         return {"success": False, "error": str(e)}
 
 
-def update_note_metadata(note_id: str, new_title: str):
+def update_note(note: JNote) -> Dict[str, Any]:
     """
-    Updates the title in the JSON file AND the Database.
-    Does NOT require opening the full file in the editor.
+    Overwrites the file on disk with the provided JNote object.
+    RETURNS timestamp for Echo Suppression.
     """
-    # 1. Get path from DB
-    meta = localdb.get_metadata(note_id)
-    if not meta:
-        return {"success": False, "error": "Note not found in index."}
-
-    file_path = meta.note_dir / f"{note_id}.jnote"
-
-    if not file_path.exists():
-        return {"success": False, "error": "File missing from disk."}
-
-    # 2. Update JSON on disk
     try:
-        with open(file_path, "r+", encoding="utf-8") as f:
-            data = json.load(f)
-            data['metadata']['title'] = new_title
-            data['metadata']['last_modified'] = datetime.now().isoformat()
+        note_id = note.metadata.note_id
 
-            f.seek(0)
-            json.dump(data, f, indent=4)
-            f.truncate()
+        # 1. Find Path via DB
+        meta = localdb.get_metadata(note_id)
+        if not meta:
+            return {"success": False, "error": f"Note {note_id} not found in index."}
 
-        # 3. Update DB
-        meta.note_title = new_title
-        localdb.add_metadata(meta)  # upsert updates it
+        file_path = meta.note_dir / f"{note_id}.jnote"
 
-        return {"success": True}
+        # 2. Update Timestamp in Object
+        note.metadata.update_timestamp()
+
+        # 3. Write to Disk
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(note.to_dict(), f, indent=4)
+
+        # 4. Get Echo Timestamp
+        # This is the magic number needed by ActiveNote to ignore the watchdog event
+        mtime = os.path.getmtime(file_path)
+
+        sys_log.log(LogSource.SYSTEM, LogLevel.INFO, f"Updated note {note_id}")
+
+        return {"success": True, "mtime": mtime}
+
     except Exception as e:
+        sys_log.log(LogSource.SYSTEM, LogLevel.ERROR, "Update note failed", meta={"error": str(e)})
         return {"success": False, "error": str(e)}
 
 
-def delete_note(note_id: str):
-    # 1. Get info from DB
-    meta = localdb.get_metadata(note_id)
-    if not meta:
-        return {"success": False, "error": "Note not found."}
-
-    file_path = meta.note_dir / f"{note_id}.jnote"
-
-    # 2. Delete from Disk
+def delete_note(note_id: str) -> Dict[str, Any]:
+    """
+    Deletes the file. Watcher handles DB cleanup.
+    """
     try:
+        meta = localdb.get_metadata(note_id)
+        if not meta:
+            return {"success": False, "error": "Note not found."}
+
+        file_path = meta.note_dir / f"{note_id}.jnote"
+
         if file_path.exists():
             os.remove(file_path)
+            sys_log.log(LogSource.SYSTEM, LogLevel.INFO, f"Deleted note file: {note_id}")
+            return {"success": True}
+        else:
+            return {"success": False, "error": "File already missing."}
+
     except Exception as e:
-        return {"success": False, "error": f"Disk error: {str(e)}"}
-
-    # 3. Delete from DB
-    localdb.delete_note(note_id)
-    return {"success": True}
+        sys_log.log(LogSource.SYSTEM, LogLevel.ERROR, "Delete note failed", meta={"error": str(e)})
+        return {"success": False, "error": str(e)}
 
 
 # ==========================================
-# CRUD: Directories
+# Directory CRUD (Filesystem Only)
 # ==========================================
 
-def create_directory(parent_path: str, dir_name: str):
+def create_directory(parent_path: str, dir_name: str) -> Dict[str, Any]:
     target_path = Path(parent_path) / dir_name
-
     try:
         os.makedirs(target_path, exist_ok=False)
-
-        # Update DB
-        localdb.add_directory(DirectoryMetadata(
-            dir_path=target_path,
-            dir_name=dir_name,
-            parent_path=Path(parent_path)
-        ))
+        sys_log.log(LogSource.SYSTEM, LogLevel.INFO, f"Created directory: {dir_name}")
         return {"success": True, "path": str(target_path)}
-    except FileExistsError:
-        return {"success": False, "error": "Directory already exists."}
     except Exception as e:
+        sys_log.log(LogSource.SYSTEM, LogLevel.ERROR, "Create directory failed", meta={"error": str(e)})
         return {"success": False, "error": str(e)}
 
 
-def update_directory_name(old_path: str, new_name: str):
+def update_directory_name(old_path: str, new_name: str) -> Dict[str, Any]:
     old_p = Path(old_path)
     new_p = old_p.parent / new_name
-
     try:
         os.rename(old_p, new_p)
-        # Using new DB method which handles deep recursion automatically
-        localdb.update_directory(str(old_p), str(new_p), new_name)
+        sys_log.log(LogSource.SYSTEM, LogLevel.INFO, f"Renamed directory: {old_p.name} -> {new_name}")
         return {"success": True, "new_path": str(new_p)}
     except Exception as e:
+        sys_log.log(LogSource.SYSTEM, LogLevel.ERROR, "Rename directory failed", meta={"error": str(e)})
         return {"success": False, "error": str(e)}
 
-def delete_directory(dir_path: str):
+
+def delete_directory(dir_path: str) -> Dict[str, Any]:
     path = Path(dir_path)
     try:
-        if path.exists(): shutil.rmtree(path)
-        localdb.delete_directory_recursive(str(path)) # Using new DB method
-        return {"success": True}
+        if path.exists():
+            shutil.rmtree(path)
+            sys_log.log(LogSource.SYSTEM, LogLevel.INFO, f"Deleted directory: {path.name}")
+            return {"success": True}
+        return {"success": False, "error": "Path not found"}
     except Exception as e:
+        sys_log.log(LogSource.SYSTEM, LogLevel.ERROR, "Delete directory failed", meta={"error": str(e)})
         return {"success": False, "error": str(e)}
-
-
-# ==========================================
-# Helpers
-# ==========================================
-
-def extract_note_metadata(file_path: Path):
-    """Efficiently extracts metadata using ijson."""
-    file_path = Path(file_path)
-    metadata = {}
-    try:
-        with open(file_path, 'rb') as f:
-            objects = ijson.items(f, 'metadata')
-            for obj in objects:
-                metadata = obj
-                break
-    except Exception as e:
-        print(f"Error reading {file_path}: {e}")
-    return metadata

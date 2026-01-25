@@ -138,9 +138,6 @@ class ActiveNote:
                     # Update data
                     block["data"] = new_content_data
 
-                    # Update block metadata (optional)
-                    block["version"] = block.get("version", 1.0) + 0.1
-
                     found = True
                     break
 
@@ -263,13 +260,14 @@ class NoteManager:
             cls._instance.active_notes = {}
         return cls._instance
 
-    def get_or_open_note(self, note_id: str) -> ActiveNote:
+    def open_existing_note(self, note_id: str) -> ActiveNote:
         # 1. Return existing instance if open
         if note_id in self.active_notes:
             return self.active_notes[note_id]
+        else:
+            raise ValueError
 
-        # 2. Create new instance (It will auto-load from DB inside __init__)
-        # If ID is invalid, ActiveNote will raise ValueError
+    def create_new_note(self, note_id: str):
         try:
             new_note = ActiveNote(note_id)
             self.active_notes[note_id] = new_note
