@@ -2,6 +2,7 @@ import json
 import ijson
 import os
 import shutil
+import time
 from typing import Union, Callable, Optional, Dict, Any
 from pathlib import Path
 from watchdog.observers import Observer
@@ -40,9 +41,53 @@ class VaultEventHandler(FileSystemEventHandler):
     This acts as the ONLY writer to the DB for structure changes.
     """
 
-    def _get_note_meta(self, file_path: str) -> Optional[Dict]:
+    @staticmethod
+    def _get_note_meta(file_path: str) -> Optional[Dict]:
         """Helper to extract metadata efficiently."""
         return VaultWatcher.extract_note_metadata(Path(file_path))
+
+    @staticmethod
+    def _notify_active_state(path: Path, mtime: float = None):
+        """
+        Helper to safely fire the callback for ANY path (Note or Directory).
+        """
+        # 1. Capture global variable locally (Fixes "None is not callable" & Thread safety)
+        callback = _on_file_change_callback
+
+        if callback is None:
+            return
+
+        try:
+            # If mtime is not provided, fetch it
+            if mtime is None:
+                if path.exists():
+                    mtime = os.path.getmtime(path)
+                else:
+                    mtime = time.time()  # Timestamp for 'now' if deleted
+
+            callback(str(path.resolve()), mtime)
+        except Exception as e:
+            # Don't crash the watcher if the callback fails
+            sys_log.log(LogSource.SYSTEM, LogLevel.WARNING, "Failed to notify ActiveState", meta={"error": str(e)})
+
+    # --- NEW HELPER METHOD ---
+    def _process_note_file(self, file_path: Path):
+        """
+        Common logic to Register/Update a note in DB and Notify ActiveState.
+        """
+        # 1. Update DB
+        meta_dict = self._get_note_meta(str(file_path))
+        if meta_dict:
+            db_meta = NoteMetadata(
+                note_id=meta_dict.get("note_id"),
+                note_title=meta_dict.get("title", file_path.stem),
+                note_version=str(meta_dict.get("version", "1.0")),
+                note_dir=file_path.parent
+            )
+            localdb.add_metadata(db_meta)
+
+        # 2. Notify ActiveState (Note Change)
+        self._notify_active_state(file_path)
 
     def on_created(self, event):
         path = Path(event.src_path)
@@ -55,26 +100,12 @@ class VaultEventHandler(FileSystemEventHandler):
                 dir_name=path.name,
                 parent_path=path.parent
             ))
+            # NOTIFY TREE REFRESH
+            self._notify_active_state(path)
+
         elif path.suffix == ".jnote":
             # Register Note
-            meta_dict = self._get_note_meta(event.src_path)
-            if meta_dict:
-                # Map raw dict to DB Metadata
-                db_meta = NoteMetadata(
-                    note_id=meta_dict.get("note_id"),
-                    note_title=meta_dict.get("title", path.stem),
-                    note_version=str(meta_dict.get("version", "1.0")),
-                    note_dir=path.parent
-                )
-                localdb.add_metadata(db_meta)
-
-        # Notify ActiveState (if it's a file)
-        if not event.is_directory and _on_file_change_callback:
-            try:
-                mtime = os.path.getmtime(event.src_path)
-                _on_file_change_callback(str(path.resolve()), mtime)
-            except FileNotFoundError:
-                pass
+            self._process_note_file(path)
 
     def on_deleted(self, event):
         path = Path(event.src_path)
@@ -82,42 +113,25 @@ class VaultEventHandler(FileSystemEventHandler):
 
         if event.is_directory:
             localdb.delete_directory_recursive(str(path))
+            # NOTIFY TREE REFRESH
+            self._notify_active_state(path)
+
         elif path.suffix == ".jnote":
-            # We need the ID to delete from DB, but the file is gone.
-            # However, our DB 'delete_note' usually requires ID.
-            # Strategy: We can't easily look up ID from path if path is gone from DB?
-            # Actually, we can query DB by path *before* we delete, or rely on a DB method that deletes by path.
-            # For now, let's assume we handle "Ghost Cleaning" separately or add a delete_by_path to DB.
-            # Ideally: localdb.delete_note_by_path(str(path))
-            # Fallback: We'll trust the Quick Scan or explicit ID calls,
-            # BUT for a true watcher, we need to handle this.
-            # *Hack for now*: We'll leave it. The User deletes via UI (which has ID).
-            # External deletes might leave ghosts until restart.
-            pass
+            # Option A: Since filename is UUID.jnote, stem is the ID.
+            note_id = path.stem
+            localdb.delete_note(note_id)
+            sys_log.log(LogSource.SYSTEM, LogLevel.INFO, f"Watcher: Removed ghost entry for {note_id}")
+
+            # NOTIFY ACTIVE NOTE (To close tab or show error)
+            self._notify_active_state(path)
 
     def on_modified(self, event):
         if event.is_directory: return
 
         path = Path(event.src_path)
         if path.suffix == ".jnote":
-            # 1. Update DB (Title/Version might have changed)
-            meta_dict = self._get_note_meta(event.src_path)
-            if meta_dict:
-                db_meta = NoteMetadata(
-                    note_id=meta_dict.get("note_id"),
-                    note_title=meta_dict.get("title", path.stem),
-                    note_version=str(meta_dict.get("version", "1.0")),
-                    note_dir=path.parent
-                )
-                localdb.add_metadata(db_meta)
-
-            # 2. Notify ActiveState (CRITICAL for Hot-Swap)
-            if _on_file_change_callback:
-                try:
-                    mtime = os.path.getmtime(event.src_path)
-                    _on_file_change_callback(str(path.resolve()), mtime)
-                except:
-                    pass
+            # Use the helper with the source path
+            self._process_note_file(path)
 
     def on_moved(self, event):
         src_path = Path(event.src_path)
@@ -126,12 +140,11 @@ class VaultEventHandler(FileSystemEventHandler):
 
         if event.is_directory:
             localdb.update_directory(str(src_path), str(dest_path), dest_path.name)
+            # NOTIFY TREE REFRESH (Target is the new location)
+            self._notify_active_state(dest_path)
+
         elif dest_path.suffix == ".jnote":
-            # Treat as Delete + Create to be safe, or just update dir?
-            # Updating dir in DB is safer if we can look up by ID.
-            # Since we can't easily get ID from 'src_path' if file is gone,
-            # we re-scan the 'dest_path'.
-            self.on_created(event)
+            self._process_note_file(dest_path)
 
 
 class VaultWatcher:

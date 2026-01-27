@@ -1,6 +1,6 @@
 import time
 import filesys
-import active_note
+import active_state
 from pathlib import Path
 
 # 1. Define your Vault Path
@@ -34,7 +34,7 @@ def main():
     print(f"\n--- 3. Opening Note: {selected_meta.note_title} ---")
 
     # Initialize the Manager
-    manager = active_note.NoteManager()
+    manager = active_state .NoteManager()
 
     # Open the note (This loads it from disk into memory)
     active_note_instance = manager.get_or_open_note(selected_meta.note_id)

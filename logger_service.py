@@ -1,7 +1,9 @@
 from enum import Enum
 import logging
 import sys
-from pathlib import Path
+import os
+from pathlib import Path  # Added for safe path handling
+
 
 # Namespace: WHERE is the log coming from?
 class LogSource(Enum):
@@ -9,6 +11,7 @@ class LogSource(Enum):
     DB = "DATABASE"  # SQL queries, connection events
     RAG = "RAG_ENGINE"  # Vector search, ingestion, inference
     API = "API_LAYER"  # Requests coming from the frontend
+
 
 # Level: HOW urgent is it?
 class LogLevel(Enum):
@@ -50,10 +53,19 @@ class VadapavLogger:
         self.logger.addHandler(console_handler)
 
         # 3. Handler: Write to File (optional but recommended)
-        # Saves to vadapav.log in your project root
-        file_handler = logging.FileHandler("vadapav.log", encoding='utf-8')
-        file_handler.setFormatter(formatter)
-        self.logger.addHandler(file_handler)
+        # FIX: Use User Home Directory to ensure write permissions in production/frozen apps.
+        # Saves to ~/.vadapav/vadapav.log
+        log_dir = Path.home() / ".vadapav"
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            log_file = log_dir / "vadapav.log"
+
+            file_handler = logging.FileHandler(log_file, encoding='utf-8')
+            file_handler.setFormatter(formatter)
+            self.logger.addHandler(file_handler)
+        except Exception:
+            # Fallback to console only if file creation fails
+            sys.stderr.write(f"Failed to create log file at {log_dir}\n")
 
     def log(self, source: LogSource, level: LogLevel, message: str, meta: dict = None):
         """
@@ -67,6 +79,7 @@ class VadapavLogger:
             full_message = f"{full_message} | Meta: {meta}"
 
         self.logger.log(level.value, full_message, extra=extra)
+
 
 # Create a global instance to import elsewhere
 sys_log = VadapavLogger()

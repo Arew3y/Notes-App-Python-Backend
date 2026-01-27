@@ -30,16 +30,6 @@ class NoteBlock:
     tags: List[str] = field(default_factory=list)
     backlinks: List[str] = field(default_factory=list)
 
-    @staticmethod
-    def create(block_type: str, content_data: Dict[str, Any]) -> "NoteBlock":
-        """Factory method to create a fresh block."""
-        return NoteBlock(
-            block_id=str(uuid.uuid4()),
-            type=block_type,
-            data=content_data,
-            version=CURRENT_BLOCK_VERSION
-        )
-
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
@@ -69,12 +59,13 @@ class NoteMetadata:
     title: str
     created_at: str  # ISO 8601 String
     last_modified: str  # ISO 8601 String
-    version: str =  CURRENT_NOTE_VERSION
+    version: str = CURRENT_NOTE_VERSION
     status: int = 0  # 0 = Active, 1 = Archived, etc.
     tags: List[str] = field(default_factory=list)
 
     def update_timestamp(self):
-        self.last_modified = datetime.now(timezone.utc).isoformat() + "Z"
+        # FIX: Use strftime to ensure valid Z format without double offsets
+        self.last_modified = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -82,11 +73,14 @@ class NoteMetadata:
     @staticmethod
     def from_dict(data: Dict[str, Any]) -> "NoteMetadata":
         # Safe extraction with defaults
+        # FIX: Correct default timestamp format
+        default_time = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+
         return NoteMetadata(
             note_id=data.get("note_id", str(uuid.uuid4())),
             title=data.get("title", "Untitled Note"),
-            created_at=data.get("created_at", datetime.now(timezone.utc).isoformat() + "Z"),
-            last_modified=data.get("last_modified", datetime.now(timezone.utc).isoformat() + "Z"),
+            created_at=data.get("created_at", default_time),
+            last_modified=data.get("last_modified", default_time),
             version=data.get("version", CURRENT_NOTE_VERSION),
             status=data.get("status", 0),
             tags=data.get("tags", [])
@@ -138,13 +132,10 @@ class JNote:
                 for b_data in data["blocks"]:
                     blocks_list.append(NoteBlock.from_dict(b_data))
 
-            custom_fields = data.get("custom_fields", {})
-
-            # 3. Return Object
             return JNote(
                 metadata=meta_obj,
                 blocks=blocks_list,
-                custom_fields=custom_fields
+                custom_fields=data.get("custom_fields", {})
             )
 
         except Exception as e:
@@ -162,7 +153,8 @@ class JNote:
         Creates a fresh, empty note with a valid ID and timestamps.
         (This replaces your old manual dictionary creation)
         """
-        now_str = datetime.now(timezone.utc).isoformat() + "Z"
+        # FIX: consistent timestamp format
+        now_str = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
         new_id = str(uuid.uuid4())
 
         meta = NoteMetadata(

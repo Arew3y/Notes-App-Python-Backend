@@ -1,3 +1,4 @@
+import os
 import sqlite3
 from pathlib import Path
 from dataclasses import dataclass, asdict
@@ -95,7 +96,7 @@ class FileIndex:
         sys_log.log(LogSource.DB, LogLevel.ERROR, f"Fetching metadata for NoteID {note_id} : FAILED")
         return None
 
-    def get_all_notes(self) -> List[NoteMetadata]:
+    def get_all_notes(self) -> Optional[List[NoteMetadata]]:
         sys_log.log(LogSource.DB, LogLevel.DEBUG, f"Fetching metadata for all notes")
 
         self.cursor.execute("SELECT note_id, note_title, note_version, note_dir FROM notes")
@@ -175,25 +176,32 @@ class FileIndex:
     def delete_directory_recursive(self, dir_path: str):
         """
         Deletes the directory, ALL sub-directories, and ALL notes inside them.
-        Uses LIKE 'path%' to find children.
+        Uses LIKE 'path/ %' to find children (fixing the prefix bug).
         """
+        import os  # Ensure os is imported for separator handling
+
         try:
             # 1. Log Intent (Warn because it's destructive)
             sys_log.log(LogSource.DB, LogLevel.WARNING, f"Recursive delete triggered for: {dir_path}")
 
-            # Delete notes in sub-folders
-            self.cursor.execute("DELETE FROM notes WHERE note_dir LIKE ? || '%'", (dir_path,))
+            # --- CRITICAL FIX ---
+            # We must append a separator (e.g., '/') to ensure we only match children.
+            # Without this, deleting ".../Project" would also delete ".../ProjectBackup"
+            safe_child_prefix = os.path.join(str(dir_path), "")
+
+            # Delete notes in sub-folders (Use safe_child_prefix)
+            self.cursor.execute("DELETE FROM notes WHERE note_dir LIKE ? || '%'", (safe_child_prefix,))
             notes_sub_count = self.cursor.rowcount
 
-            # Delete notes in this folder
+            # Delete notes in this folder (Exact match)
             self.cursor.execute("DELETE FROM notes WHERE note_dir = ?", (dir_path,))
             notes_curr_count = self.cursor.rowcount
 
-            # Delete sub-folders
-            self.cursor.execute("DELETE FROM directories WHERE dir_path LIKE ? || '%'", (dir_path,))
+            # Delete sub-folders (Use safe_child_prefix)
+            self.cursor.execute("DELETE FROM directories WHERE dir_path LIKE ? || '%'", (safe_child_prefix,))
             dirs_sub_count = self.cursor.rowcount
 
-            # Delete the folder itself
+            # Delete the folder itself (Exact match)
             self.cursor.execute("DELETE FROM directories WHERE dir_path = ?", (dir_path,))
             dirs_curr_count = self.cursor.rowcount
 
